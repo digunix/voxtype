@@ -11,6 +11,9 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # Whisper models
+        whisperModels = import ./nix/whisper-models.nix { inherit pkgs; };
+
         # Common build inputs for all variants
         commonNativeBuildInputs = with pkgs; [
           cmake
@@ -26,12 +29,12 @@
         ];
 
         # Base derivation for voxtype
-        mkVoxtype = { pname ? "voxtype", features ? [], extraNativeBuildInputs ? [], extraBuildInputs ? [] }:
-          pkgs.rustPlatform.buildRustPackage {
+        mkVoxtype = { pname ? "voxtype", features ? [], extraNativeBuildInputs ? [], extraBuildInputs ? [], extraEnv ? {} }:
+          pkgs.rustPlatform.buildRustPackage ({
             inherit pname;
-            version = "0.4.7";
+            version = "0.4.9";
 
-            src = ./.;
+            src = pkgs.lib.cleanSource ./.;
             cargoLock.lockFile = ./Cargo.lock;
 
             nativeBuildInputs = commonNativeBuildInputs ++ extraNativeBuildInputs;
@@ -85,14 +88,17 @@
               platforms = [ "x86_64-linux" "aarch64-linux" ];
               mainProgram = "voxtype";
             };
-          };
+          } // extraEnv);
 
       in {
         packages = {
           # Default: CPU-only build (AVX2 baseline on x86_64)
           default = mkVoxtype {};
 
-          # Vulkan GPU acceleration
+          # Alias for clarity
+          cpu = mkVoxtype {};
+
+          # Vulkan GPU acceleration (works on AMD, NVIDIA, Intel)
           vulkan = let
             vulkanPkg = mkVoxtype {
               pname = "voxtype-vulkan";
@@ -116,7 +122,43 @@
               export Vulkan_LIBRARY="${pkgs.vulkan-loader}/lib/libvulkan.so"
             '';
           });
+
+          # ROCm/HIP GPU acceleration (AMD GPUs)
+          # Note: This requires ROCm to be available in nixpkgs
+          rocm = let
+            rocmPkg = mkVoxtype {
+              pname = "voxtype-rocm";
+              features = [ "gpu-hipblas" ];
+              extraNativeBuildInputs = with pkgs; [
+                rocmPackages.clr
+                rocmPackages.hipblas
+                rocmPackages.rocblas
+              ];
+              extraBuildInputs = with pkgs; [
+                rocmPackages.clr
+                rocmPackages.hipblas
+                rocmPackages.rocblas
+              ];
+            };
+          in rocmPkg.overrideAttrs (old: {
+            preBuild = (old.preBuild or "") + ''
+              export CMAKE_BUILD_PARALLEL_LEVEL=$NIX_BUILD_CORES
+              export HIP_PATH="${pkgs.rocmPackages.clr}"
+              export ROCM_PATH="${pkgs.rocmPackages.clr}"
+            '';
+          });
+
+          # Whisper models as packages (for pre-downloading)
+          whisper-model-tiny-en = whisperModels.tiny-en;
+          whisper-model-base-en = whisperModels.base-en;
+          whisper-model-small-en = whisperModels.small-en;
+          whisper-model-medium-en = whisperModels.medium-en;
+          whisper-model-large-v3 = whisperModels.large-v3;
+          whisper-model-large-v3-turbo = whisperModels.large-v3-turbo;
         };
+
+        # Expose models for use in modules
+        inherit whisperModels;
 
         # Development shell with all dependencies
         devShells.default = pkgs.mkShell {
@@ -144,17 +186,69 @@
               package = lib.mkOption {
                 type = lib.types.package;
                 default = self.packages.${pkgs.system}.default;
-                description = "The voxtype package to use";
+                defaultText = lib.literalExpression "voxtype.packages.\${system}.default";
+                description = "The voxtype package to use.";
+              };
+
+              typingBackend = lib.mkOption {
+                type = lib.types.enum [ "wtype" "ydotool" "auto" ];
+                default = "auto";
+                description = ''
+                  Backend for text output:
+                  - wtype: Wayland virtual keyboard (recommended)
+                  - ydotool: Uses uinput, works on X11 and Wayland
+                  - auto: Install both, let voxtype choose
+                '';
+              };
+
+              enableUinput = lib.mkOption {
+                type = lib.types.bool;
+                default = true;
+                description = ''
+                  Enable uinput kernel module.
+                  Required for ydotool and built-in hotkey support.
+                '';
+              };
+
+              inputGroupUsers = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                example = [ "kevin" ];
+                description = ''
+                  Users to add to the input group for evdev hotkey access.
+                  Not needed if using compositor keybindings.
+                '';
               };
             };
 
             config = lib.mkIf cfg.enable {
-              environment.systemPackages = [ cfg.package ];
+              environment.systemPackages = with pkgs; [
+                cfg.package
+                wl-clipboard
+              ] ++ lib.optional (cfg.typingBackend == "wtype" || cfg.typingBackend == "auto") wtype
+                ++ lib.optional (cfg.typingBackend == "ydotool" || cfg.typingBackend == "auto") ydotool;
 
-              # Users need input group access for evdev
-              # Note: Users must add themselves to the input group
-              # or configure appropriate udev rules
+              hardware.uinput.enable = lib.mkIf cfg.enableUinput true;
+
+              users.users = lib.mkIf (cfg.inputGroupUsers != [ ]) (
+                lib.genAttrs cfg.inputGroupUsers (user: {
+                  extraGroups = [ "input" ];
+                })
+              );
+
+              systemd.user.services.ydotool = lib.mkIf (cfg.typingBackend == "ydotool" || cfg.typingBackend == "auto") {
+                description = "ydotool daemon";
+                wantedBy = [ "graphical-session.target" ];
+                partOf = [ "graphical-session.target" ];
+                serviceConfig = {
+                  ExecStart = "${pkgs.ydotool}/bin/ydotoold";
+                  Restart = "on-failure";
+                };
+              };
             };
           };
+
+        # Home Manager module
+        homeModules.default = import ./nix/home-manager-module.nix;
       };
 }

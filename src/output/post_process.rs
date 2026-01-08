@@ -231,8 +231,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_whitespace_trimming() {
-        // Output has trailing newline which should be trimmed
-        let config = make_config("echo 'hello'", 5000);
+        // Output has trailing/leading whitespace which should be trimmed
+        let config = make_config("printf '  hello  \\n'", 5000);
         let processor = PostProcessor::new(&config);
         let result = processor.process("ignored").await;
         assert_eq!(result, "hello");
